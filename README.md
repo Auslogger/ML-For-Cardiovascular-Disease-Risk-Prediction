@@ -122,8 +122,8 @@ Each of these now has a regression test in [`tests/`](tests/).
 You need Python 3.12. On macOS, install the OpenMP runtime first (`brew install libomp`); XGBoost and LightGBM need it.
 
 ```bash
-git clone https://github.com/Auslogger/heart-risk-ml-showdown.git
-cd heart-risk-ml-showdown
+git clone https://github.com/Auslogger/ML-For-Cardiovascular-Disease-Risk-Prediction.git
+cd ML-For-Cardiovascular-Disease-Risk-Prediction
 python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
