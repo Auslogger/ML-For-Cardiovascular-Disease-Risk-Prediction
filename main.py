@@ -17,16 +17,17 @@ from src.config import (
     PROCESSED_DATA_DIR,
     RANDOM_SEED,
     TABLES_DIR, TARGET_COLUMN,
-    VALIDATION_SIZE, TEST_SIZE
+    PRIMARY_IMBALANCE_STRATEGY,
 )
 from src.utils import Timer, logger, initialise_utilities
-from src.data_preprocessing import DataPreprocessor
+from src.data_preprocessing import DataPreprocessor, make_train_val_test_split
 from src.eda import ExploratoryDataAnalyzer
 from src.feature_engineering import create_feature_engineering_pipeline
-from src.class_imbalance import demonstrate_imbalance_handling
+from src.class_imbalance import ImbalanceHandler, demonstrate_imbalance_handling
 from src.model_training import ModelTrainer
-from sklearn.model_selection import train_test_split
 from pathlib import Path
+
+SAMPLING_COMPARISON_CSV = TABLES_DIR / 'sampling_methods_comparison.csv'
 
 
 # Stabilize joblib temp handling on Windows to reduce loky resource_tracker warnings
@@ -59,23 +60,26 @@ def configure_logging() -> None:
         force=True,  # prevents handler duplication
     )
 
-def make_train_val_test_split(train_engineered: pd.DataFrame):
-    X = train_engineered.drop(TARGET_COLUMN, axis=1)
-    y = train_engineered[TARGET_COLUMN]
+def load_imbalance_results(train_engineered: pd.DataFrame) -> dict:
+    """
+    Rebuild the bits of Phase 4 output that later phases need, when running them on
+    their own: class weights from the training split, and the strategy Phase 4 chose
+    (read back from its saved comparison table).
+    """
+    _, _, _, y_train, _, _ = make_train_val_test_split(train_engineered)
+    handler = ImbalanceHandler()
+    results = {'class_weights': handler.calculate_class_weights(y_train)}
 
-    # 1) carve out final test
-    X_temp, X_test, y_temp, y_test = train_test_split(
-        X, y, test_size=TEST_SIZE, random_state=RANDOM_SEED, stratify=y
-    )
-
-    # 2) carve out validation from remaining
-    # adjust so VALIDATION_SIZE is relative to full dataset
-    val_size_adj = VALIDATION_SIZE / (1.0 - TEST_SIZE)
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_temp, y_temp, test_size=val_size_adj, random_state=RANDOM_SEED, stratify=y_temp
-    )
-
-    return X_train, X_val, X_test, y_train, y_val, y_test
+    if SAMPLING_COMPARISON_CSV.exists():
+        comparison = pd.read_csv(SAMPLING_COMPARISON_CSV)
+        results['best_method'] = handler.select_best_sampling_method(comparison)
+        logger.info(f"Using imbalance strategy from Phase 4 table: {results['best_method']}")
+    else:
+        results['best_method'] = PRIMARY_IMBALANCE_STRATEGY
+        logger.info(
+            f"No Phase 4 comparison table found; falling back to {PRIMARY_IMBALANCE_STRATEGY}"
+        )
+    return results
 
 def run_phase_1_and_2():
     """Run Phase 1 (Setup) and Phase 2 (EDA)."""
@@ -243,23 +247,21 @@ def run_phase_3_and_4(preprocessor, eda_results):
     logger.info("="*60)
     
     with Timer("Phase 4"):
-        # Separate features and target
-        X = train_engineered.drop(TARGET_COLUMN, axis=1)
-        y = train_engineered[TARGET_COLUMN]
-        
-        # Demonstrate imbalance handling techniques
-        imbalance_results = demonstrate_imbalance_handling(X, y)
-        
+        # Choosing an imbalance strategy is a modelling decision, so it only gets to
+        # see the training split (same deterministic split Phases 5-8 use).
+        X_train, _, _, y_train, _, _ = make_train_val_test_split(train_engineered)
+
+        imbalance_results = demonstrate_imbalance_handling(X_train, y_train)
+
         # Log key results
         logger.info("\nImbalance handling results:")
         logger.info(f"Original imbalance ratio: {imbalance_results['imbalance_analysis']['imbalance_ratio']:.2f}")
         logger.info(f"Class weights calculated: {imbalance_results['class_weights']}")
-        
+
         # Save comparison results
         comparison_df = imbalance_results['sampling_comparison']
-        comparison_path = TABLES_DIR / 'sampling_methods_comparison.csv'
-        comparison_df.to_csv(comparison_path, index=False)
-        logger.info(f"\nSampling methods comparison saved to: {comparison_path}")
+        comparison_df.to_csv(SAMPLING_COMPARISON_CSV, index=False)
+        logger.info(f"\nSampling methods comparison saved to: {SAMPLING_COMPARISON_CSV}")
     
     return train_engineered, test_engineered, engineer, imbalance_results
 
@@ -453,7 +455,7 @@ def run_phase_6_advanced_models(X_train, y_train, X_val, y_val, imbalance_result
     trainer = ModelTrainer(random_state=RANDOM_SEED)
 
     class_weight = imbalance_results.get("class_weights")
-    imbalance_strategy = imbalance_results.get("best_method", "smote_nc")  # or PRIMARY_IMBALANCE_STRATEGY from config
+    imbalance_strategy = imbalance_results.get("best_method", PRIMARY_IMBALANCE_STRATEGY)
 
     results = trainer.train_and_tune_phase6(
         X_train=X_train, y_train=y_train,
@@ -858,15 +860,7 @@ def main():
                 # Load engineered data if running phase separately
                 logger.info("Loading engineered data from Phase 3-4...")
                 train_engineered = pd.read_csv(PROCESSED_DATA_DIR / "train_engineered.csv")
-                
-                # Load imbalance results
-                from src.class_imbalance import ImbalanceHandler
-                handler = ImbalanceHandler()
-                X = train_engineered.drop(TARGET_COLUMN, axis=1)
-                y = train_engineered[TARGET_COLUMN]
-                imbalance_results = {
-                    'class_weights': handler.calculate_class_weights(y)
-                }
+                imbalance_results = load_imbalance_results(train_engineered)
             
             trainer, X_train, X_val, X_test, y_train, y_val, y_test, baseline_results = run_phase_5_baseline(
                 train_engineered, engineer, imbalance_results
@@ -883,14 +877,7 @@ def main():
             if train_engineered is None:
                 logger.info("Loading engineered data from Phase 3-4...")
                 train_engineered = pd.read_csv(PROCESSED_DATA_DIR / "train_engineered.csv")
-
-                from src.class_imbalance import ImbalanceHandler
-                handler = ImbalanceHandler()
-                X_tmp = train_engineered.drop(TARGET_COLUMN, axis=1)
-                y_tmp = train_engineered[TARGET_COLUMN]
-                imbalance_results = {
-                    'class_weights': handler.calculate_class_weights(y_tmp)
-                }
+                imbalance_results = load_imbalance_results(train_engineered)
 
             # If we don't have the split yet, reuse Phase 5’s splitting logic:
             if trainer is None:

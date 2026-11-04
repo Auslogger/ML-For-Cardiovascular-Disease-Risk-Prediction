@@ -10,12 +10,16 @@ import logging
 from collections import Counter
 import matplotlib.pyplot as plt
 
-from sklearn.model_selection import StratifiedKFold
+from sklearn.base import clone
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold, cross_validate
 from sklearn.metrics import confusion_matrix
+from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
 from imblearn.over_sampling import SMOTE, ADASYN, BorderlineSMOTE, SMOTENC
 from imblearn.under_sampling import RandomUnderSampler, TomekLinks
 from imblearn.combine import SMOTETomek, SMOTEENN
+from imblearn.pipeline import Pipeline as ImbPipeline
 
 from src.config import (
     CV_FOLDS, RANDOM_SEED, TARGET_COLUMN,
@@ -391,114 +395,159 @@ class ImbalanceHandler:
         
         return best_threshold
     
+    def _build_probe_pipeline(self, method: str,
+                              categorical_indices: List[int] = None) -> ImbPipeline:
+        """
+        Quick, cheap model used to compare imbalance strategies on equal terms.
+
+        Scaling -> (optional) resampler -> logistic regression. The resampler lives
+        inside an imblearn Pipeline, so during cross-validation it only ever sees the
+        training folds; the scoring folds keep the real ~15% prevalence.
+        'none' means no resampling and class-weighted loss instead, so the
+        imbalance is corrected exactly once in every variant.
+        """
+        sampler = self.get_sampler(
+            method,
+            categorical_indices=categorical_indices if method == 'smote_nc' else None,
+        )
+        steps = [('scale', StandardScaler())]
+        if sampler is not None:
+            steps.append(('sampler', sampler))
+        steps.append(('clf', LogisticRegression(
+            max_iter=2000,
+            class_weight='balanced' if sampler is None else None,
+            random_state=self.random_state,
+        )))
+        return ImbPipeline(steps)
+
     def compare_sampling_methods(self, X: pd.DataFrame, y: pd.Series,
                                methods: List[str] = None,
-                               categorical_indices: List[int] = None) -> pd.DataFrame:
+                               categorical_indices: List[int] = None,
+                               cv_folds: int = CV_FOLDS) -> pd.DataFrame:
         """
-        Compare different sampling methods.
-        
+        Compare imbalance strategies by cross-validated ROC-AUC / average precision.
+
+        Pass the *training split only*: the choice made here is a modelling decision
+        and must not see the validation or test rows.
+
         Args:
-            X: Feature matrix
-            y: Target variable
+            X: Feature matrix (training split)
+            y: Target variable (training split)
             methods: List of methods to compare
-            categorical_indices: Indices of categorical features
-            
+            categorical_indices: Indices of categorical features (for SMOTE-NC)
+            cv_folds: Number of stratified CV folds
+
         Returns:
-            Comparison DataFrame
+            Comparison DataFrame with class counts after resampling and CV scores
         """
         if methods is None:
-            methods = ['none', 'smote', 'borderline_smote', 'adasyn', 
+            methods = ['none', 'smote', 'borderline_smote', 'adasyn',
                       'random_under', 'smote_tomek']
-            
+
             # Add SMOTE-NC if categorical features are available
             if categorical_indices and len(categorical_indices) > 0:
                 methods.append('smote_nc')
-        
-        module_logger.info(f"Comparing sampling methods: {methods}")
-        
+
+        module_logger.info(f"Comparing sampling methods with {cv_folds}-fold CV: {methods}")
+
+        X_numeric = self._validate_data_for_smote(X)
+        cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=self.random_state)
         results = []
-        
+
         for method in methods:
-            module_logger.info(f"\nTesting method: {method}")
-            
+            if method == 'smote_nc' and not categorical_indices:
+                module_logger.warning("Skipping smote_nc (no categorical features supplied)")
+                continue
+
             try:
-                # Apply sampling
-                if method == 'none':
-                    X_sampled, y_sampled = X, y
-                elif method == 'smote':
-                    X_sampled, y_sampled = self.apply_smote(X, y, 'regular')
-                elif method == 'borderline_smote':
-                    X_sampled, y_sampled = self.apply_smote(X, y, 'borderline')
-                elif method == 'adasyn':
-                    X_sampled, y_sampled = self.apply_smote(X, y, 'adasyn')
-                elif method == 'random_under':
-                    X_sampled, y_sampled = self.apply_undersampling(X, y, 'random')
-                elif method == 'smote_tomek':
-                    X_sampled, y_sampled = self.apply_combined_sampling(X, y, 'smote_tomek')
-                elif method == 'smote_nc' and categorical_indices:
-                    X_sampled, y_sampled = self.apply_smote(
-                        X, y, 'nc', categorical_indices
-                    )
+                pipe = self._build_probe_pipeline(method, categorical_indices)
+                scores = cross_validate(
+                    pipe, X_numeric, y, cv=cv,
+                    scoring={'roc_auc': 'roc_auc', 'average_precision': 'average_precision'},
+                    n_jobs=-1,
+                )
+
+                # Class balance the model would actually be trained on (for the plot/table)
+                if 'sampler' in pipe.named_steps:
+                    X_scaled = StandardScaler().fit_transform(X_numeric)
+                    _, y_sampled = clone(pipe.named_steps['sampler']).fit_resample(X_scaled, y)
                 else:
-                    module_logger.warning(f"Skipping method {method} (not applicable)")
-                    continue
-                
-                # Calculate statistics
+                    y_sampled = y
                 class_counts = Counter(y_sampled)
-                
-                results.append({
+
+                row = {
                     'method': method,
                     'total_samples': len(y_sampled),
                     'class_0_count': class_counts[0],
                     'class_1_count': class_counts[1],
                     'class_0_pct': class_counts[0] / len(y_sampled) * 100,
                     'class_1_pct': class_counts[1] / len(y_sampled) * 100,
-                    'imbalance_ratio': class_counts[0] / class_counts[1] if class_counts[1] > 0 else np.inf
-                })
-                
+                    'imbalance_ratio': class_counts[0] / class_counts[1] if class_counts[1] > 0 else np.inf,
+                    'cv_roc_auc_mean': float(np.mean(scores['test_roc_auc'])),
+                    'cv_roc_auc_std': float(np.std(scores['test_roc_auc'])),
+                    'cv_ap_mean': float(np.mean(scores['test_average_precision'])),
+                    'cv_ap_std': float(np.std(scores['test_average_precision'])),
+                }
+                results.append(row)
+                module_logger.info(
+                    f"  {method:<16} CV ROC-AUC {row['cv_roc_auc_mean']:.4f} (+/- {row['cv_roc_auc_std']:.4f}), "
+                    f"AP {row['cv_ap_mean']:.4f}"
+                )
+
             except Exception as e:
-                module_logger.error(f"Failed to apply method {method}: {str(e)}")
+                module_logger.error(f"Failed to evaluate method {method}: {str(e)}")
                 continue
-        
+
         comparison_df = pd.DataFrame(results)
-        
+
         if len(comparison_df) > 0:
-            # Create visualisation
-            fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-            
-            # Sample counts
-            methods_list = comparison_df['method'].tolist()
-            x_pos = np.arange(len(methods_list))
-            
-            width = 0.35
-            axes[0].bar(x_pos - width/2, comparison_df['class_0_count'], width, 
-                   label='Class 0', color='skyblue')
-            axes[0].bar(x_pos + width/2, comparison_df['class_1_count'], width, 
-                   label='Class 1', color='salmon')
-            
-            axes[0].set_xlabel('Sampling Method')
-            axes[0].set_ylabel('Sample Count')
-            axes[0].set_title('Class Distribution by Sampling Method')
-            axes[0].set_xticks(x_pos)
-            axes[0].set_xticklabels(methods_list, rotation=45)
-            axes[0].legend()
-            axes[0].grid(True, alpha=0.3)
-            
-            # Imbalance ratios
-            axes[1].bar(x_pos, comparison_df['imbalance_ratio'], color='lightgreen')
-            axes[1].set_xlabel('Sampling Method')
-            axes[1].set_ylabel('Imbalance Ratio')
-            axes[1].set_title('Imbalance Ratio by Sampling Method')
-            axes[1].set_xticks(x_pos)
-            axes[1].set_xticklabels(methods_list, rotation=45)
-            axes[1].axhline(y=1, color='r', linestyle='--', label='Perfect balance')
-            axes[1].legend()
-            axes[1].grid(True, alpha=0.3)
-            
-            plt.tight_layout()
-            save_figure(fig, 'sampling_methods_comparison', 'imbalance')
-        
+            self._plot_sampling_comparison(comparison_df)
+
         return comparison_df
+
+    @staticmethod
+    def _plot_sampling_comparison(comparison_df: pd.DataFrame) -> None:
+        """Class counts after resampling (left) and CV ROC-AUC per method (right)."""
+        blue, orange = '#2a78d6', '#eb6834'
+        muted, ink, grid = '#8a8984', '#0b0b0b', '#e6e5e0'
+
+        df = comparison_df.sort_values('cv_roc_auc_mean', ascending=True).reset_index(drop=True)
+        best_method = df.iloc[-1]['method']
+
+        fig, axes = plt.subplots(1, 2, figsize=(15, 5.5), facecolor='#fcfcfb')
+        for ax in axes:
+            ax.set_facecolor('#fcfcfb')
+            for side in ('top', 'right'):
+                ax.spines[side].set_visible(False)
+            ax.grid(True, color=grid, linewidth=0.8)
+            ax.set_axisbelow(True)
+
+        # Left: what each method does to the training class balance
+        y_pos = np.arange(len(df))
+        height = 0.38
+        axes[0].barh(y_pos + height / 2, df['class_0_count'], height, color=blue, label='No CHD (0)')
+        axes[0].barh(y_pos - height / 2, df['class_1_count'], height, color=orange, label='CHD within 10y (1)')
+        axes[0].set_yticks(y_pos)
+        axes[0].set_yticklabels(df['method'])
+        axes[0].set_xlabel('Training samples after resampling')
+        axes[0].set_title('Class balance each method produces', loc='left', color=ink)
+        axes[0].legend(frameon=False, loc='lower right')
+
+        # Right: what that does to ranking quality (the thing we actually care about)
+        colours = [blue if m == best_method else muted for m in df['method']]
+        axes[1].errorbar(
+            df['cv_roc_auc_mean'], y_pos, xerr=df['cv_roc_auc_std'],
+            fmt='none', ecolor=muted, elinewidth=1.5, capsize=0,
+        )
+        axes[1].scatter(df['cv_roc_auc_mean'], y_pos, s=64, c=colours, zorder=3,
+                        edgecolors='#fcfcfb', linewidths=2)
+        axes[1].set_yticks(y_pos)
+        axes[1].set_yticklabels(df['method'])
+        axes[1].set_xlabel('Cross-validated ROC-AUC (mean ± 1 sd, logistic probe)')
+        axes[1].set_title(f'Ranking quality — selected: {best_method}', loc='left', color=ink)
+
+        plt.tight_layout()
+        save_figure(fig, 'sampling_methods_comparison', 'imbalance')
 
     def select_best_sampling_method(
             self,
@@ -510,13 +559,18 @@ class ImbalanceHandler:
         """
         Choose the best sampling method from compare_sampling_methods() output.
 
-        Strategy (fast, no extra model training):
-        - Prefer methods that bring imbalance_ratio close to 1.0 (balanced).
-        - Tie-break by retaining samples (avoid heavy undersampling).
-        - If comparison_df has CV columns (cv_roc_auc_mean), use that as primary selector.
+        - If CV scores are present (the normal case), pick the highest mean CV ROC-AUC.
+          'none' (class weights, no resampling) competes on equal terms here.
+        - Legacy fallback for tables without CV columns: prefer methods closest to a
+          1:1 balance, tie-broken by sample retention.
         """
         if comparison_df is None or comparison_df.empty:
             return "smote_nc"
+
+        if "cv_roc_auc_mean" in comparison_df.columns and comparison_df["cv_roc_auc_mean"].notna().any():
+            df = comparison_df.dropna(subset=["cv_roc_auc_mean"])
+            df = df.sort_values(["cv_roc_auc_mean", "total_samples"], ascending=[False, False])
+            return str(df.iloc[0]["method"])
 
         df = comparison_df.copy()
 
@@ -525,11 +579,6 @@ class ImbalanceHandler:
 
         if df.empty:
             return "none"
-
-        # If you later choose to compute quick CV scores, prefer them.
-        if "cv_roc_auc_mean" in df.columns and df["cv_roc_auc_mean"].notna().any():
-            df = df.sort_values(["cv_roc_auc_mean", "total_samples"], ascending=[False, False])
-            return str(df.iloc[0]["method"])
 
         # Otherwise: balance closeness + retention
         # baseline totals (use 'none' row if present, else max total_samples)
@@ -613,14 +662,14 @@ class ImbalanceHandler:
 
 def demonstrate_imbalance_handling(X: pd.DataFrame, y: pd.Series) -> Dict[str, Any]:
     """
-    Demonstrate various imbalance handling techniques.
-    
+    Analyse the imbalance and choose a strategy for Phase 6.
+
     Args:
-        X: Feature matrix
-        y: Target variable
-        
+        X: Feature matrix (training split only)
+        y: Target variable (training split only)
+
     Returns:
-        Dictionary with results
+        Dictionary with results, including 'best_method'
     """
     handler = ImbalanceHandler()
     

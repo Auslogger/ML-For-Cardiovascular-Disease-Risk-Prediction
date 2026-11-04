@@ -122,6 +122,7 @@ class ModelTrainer:
             return cb.CatBoostClassifier(
                 random_state=self.random_state,
                 verbose=False,
+                allow_writing_files=False,  # don't litter the repo with catboost_info/
                 **kwargs
             )
         
@@ -1134,18 +1135,21 @@ class ModelTrainer:
                 categorical_indices=cat_indices_after if imbalance_strategy == "smote_nc" else None,
             )
 
-        # class_weight handling (you already do this today)
+        # Correct for imbalance exactly once: either resample the training folds OR
+        # weight the loss, never both. Doing both over-corrects, which pushes predicted
+        # probabilities up and drags the "optimal" decision threshold towards ~0.8.
         model_params = {}
-        if class_weight and model_name in ["svm", "random_forest", "extra_trees"]:
-            model_params["class_weight"] = class_weight
-        elif class_weight and model_name == "xgboost":
-            model_params["scale_pos_weight"] = class_weight[1] / class_weight[0]
-        elif class_weight and model_name == "lightgbm":
-            model_params["class_weight"] = class_weight
-        elif class_weight and model_name == "catboost":
-            model_params["class_weights"] = class_weight
+        if sampler is None and class_weight:
+            if model_name in ["svm", "random_forest", "extra_trees", "lightgbm"]:
+                model_params["class_weight"] = class_weight
+            elif model_name == "xgboost":
+                model_params["scale_pos_weight"] = class_weight[1] / class_weight[0]
+            elif model_name == "catboost":
+                # Same 1:5.6 ratio as the 'balanced' weights. CatBoost rewrites a dict
+                # passed as class_weights, which breaks sklearn's clone() in the search.
+                model_params["auto_class_weights"] = "Balanced"
 
-        model = self.get_model(model_name, **model_params)  # existing method :contentReference[oaicite:18]{index=18}
+        model = self.get_model(model_name, **model_params)
 
         steps = [("preprocess", preprocess), ("to_numpy", to_numpy)]
         if sampler is not None:
@@ -1173,6 +1177,14 @@ class ModelTrainer:
         results_all = {}
 
         cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=self.random_state)
+
+        if imbalance_strategy != "none":
+            module_logger.info(
+                f"Phase 6 imbalance handling: '{imbalance_strategy}' resampling inside each "
+                f"CV training fold (no class weights)"
+            )
+        else:
+            module_logger.info("Phase 6 imbalance handling: class-weighted loss (no resampling)")
 
         for model_name in models_to_run:
             module_logger.info(f"Phase 6: tuning {model_name}")
