@@ -1,6 +1,9 @@
+# Tested with Python 3.12.
+
 # Core scientific computing
-numpy>=1.24.0
-pandas>=2.0.0
+# (pandas 3 changed string dtypes and copy semantics; the pipeline targets 2.x)
+numpy>=1.24.0,<2.3
+pandas>=2.0.0,<3.0
 scipy>=1.10.0
 
 # Machine learning
@@ -8,6 +11,7 @@ scikit-learn==1.6.1
 imbalanced-learn==0.14.0
 
 # Gradient boosting libraries
+# macOS: XGBoost/LightGBM need the OpenMP runtime -> `brew install libomp`
 xgboost>=1.7.0
 lightgbm>=4.0.0
 catboost>=1.2.0
@@ -26,6 +30,7 @@ joblib>=1.3.0
 pyyaml>=6.0
 tqdm>=4.65.0
 tabulate>=0.9.0
+psutil>=5.9.0
 
 # Statistical testing
 statsmodels>=0.14.0
@@ -33,6 +38,5 @@ statsmodels>=0.14.0
 # Hyperparameter optimisation
 optuna>=3.3.0
 
-psutil>=5.9.0
-
-#tensorflow==2.13.0
+# Testing
+pytest>=8.0
