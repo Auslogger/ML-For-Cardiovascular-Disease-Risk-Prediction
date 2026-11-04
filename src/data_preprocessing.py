@@ -4,7 +4,6 @@ Handles data loading, cleaning, and initial preprocessing
 """
 
 import numpy as np
-from scipy import stats
 import pandas as pd
 from typing import Tuple, Dict, Optional
 import logging
@@ -15,14 +14,46 @@ from sklearn.impute import SimpleImputer, KNNImputer
 from sklearn.compose import ColumnTransformer
 
 from src.config import (
-    RAW_DATA_DIR, PROCESSED_DATA_DIR, 
+    RAW_DATA_DIR, PROCESSED_DATA_DIR,
     TRAIN_FILE, TEST_FILE, TARGET_COLUMN,
-    RANDOM_SEED, TEST_SIZE
+    RANDOM_SEED, TEST_SIZE, VALIDATION_SIZE,
+    WINSORISE_QUANTILES,
 )
 from src.utils import load_data, validate_dataframe, Timer
 
 # Get module logger
 module_logger = logging.getLogger(__name__)
+
+# Natural order of the binned cigsPerDay feature (used for ordinal encoding later)
+SMOKING_INTENSITY_ORDER = ['non_smoker', 'light', 'moderate', 'heavy']
+
+
+def make_train_val_test_split(train_engineered: pd.DataFrame):
+    """
+    Split the labelled data into stratified train / validation / test sets (60/20/20).
+
+    - train: model fitting and cross-validated hyperparameter search
+    - validation: decision-threshold selection and calibration checks
+    - test: touched once, for the final model comparison (Phase 7) and Phase 8
+
+    The split is deterministic (RANDOM_SEED) so every phase sees the same cohorts.
+    """
+    X = train_engineered.drop(TARGET_COLUMN, axis=1)
+    y = train_engineered[TARGET_COLUMN]
+
+    # 1) carve out final test
+    X_temp, X_test, y_temp, y_test = train_test_split(
+        X, y, test_size=TEST_SIZE, random_state=RANDOM_SEED, stratify=y
+    )
+
+    # 2) carve out validation from remaining
+    # adjust so VALIDATION_SIZE is relative to full dataset
+    val_size_adj = VALIDATION_SIZE / (1.0 - TEST_SIZE)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_temp, y_temp, test_size=val_size_adj, random_state=RANDOM_SEED, stratify=y_temp
+    )
+
+    return X_train, X_val, X_test, y_train, y_val, y_test
 
 class DataPreprocessor:
     """
@@ -43,6 +74,7 @@ class DataPreprocessor:
         self.feature_names = None
         self.categorical_features = None
         self.numerical_features = None
+        self.outlier_limits = {}
         self.data_info = {}
         
     def load_datasets(self, train_path: Optional[Path] = None, 
@@ -215,7 +247,7 @@ class DataPreprocessor:
                             threshold: float = 0.5) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
         Handle missing values in the datasets with proper type conversion.
-        Now includes outlier capping, distribution transformation, and high-cardinality feature binning.
+        Also caps outliers in continuous features and bins the high-cardinality cigsPerDay.
         """
         module_logger.info(f"Handling missing values with strategy: {strategy}")
         
@@ -324,58 +356,47 @@ class DataPreprocessor:
             if col in test_df.columns:
                 test_df[col] = pd.to_numeric(test_df[col], errors='coerce')
         
-        # === OUTLIER HANDLING AND DISTRIBUTION TRANSFORMATION ===
-        # Identify numerical features (excluding identifiers)
-        valid_numerical = [col for col in self.numerical_features 
-                        if col not in ['id'] and 
-                        col in train_df.columns]
-        
-        if valid_numerical:
-            module_logger.info("Applying outlier capping and distribution transformations")
-            
-            # 1. Outlier capping at 5th and 95th percentiles
-            outlier_limits = {}
-            for col in valid_numerical:
-                # Only process if we have numeric data
-                if pd.api.types.is_numeric_dtype(train_df[col]):
-                    # Compute percentiles from training data only
-                    low = train_df[col].quantile(0.05)
-                    high = train_df[col].quantile(0.95)
-                    outlier_limits[col] = (low, high)
-                    
-                    # Apply capping to both train and test
-                    train_df[col] = train_df[col].clip(lower=low, upper=high)
-                    if col in test_df.columns and pd.api.types.is_numeric_dtype(test_df[col]):
-                        test_df[col] = test_df[col].clip(lower=low, upper=high)
-            
-            # 2. Apply log transformation to skewed features
-            skewed_features = []
-            for col in valid_numerical:
-                # Only process if we have numeric data
-                if pd.api.types.is_numeric_dtype(train_df[col]):
-                    # Skip if constant values/binary
-                    if train_df[col].nunique() <= 2:
-                        # Identify features with significant skewness
-                        skew_val = stats.skew(train_df[col].dropna())
-                        if abs(skew_val) > 0.5:  # Threshold for moderate skew
-                            skewed_features.append(col)
-                            # Apply log1p transformation (handles zeros)
-                            train_df[col] = np.log1p(train_df[col])
-                            if col in test_df.columns and pd.api.types.is_numeric_dtype(test_df[col]):
-                                test_df[col] = np.log1p(test_df[col])
-            
-            if skewed_features:
-                module_logger.info(f"Applied log transformation to skewed features: {skewed_features}")
-        
+        # === OUTLIER CAPPING (continuous features only) ===
+        # Binary flags (diabetes, BPMeds, prevalentHyp) must be excluded: with ~3%
+        # prevalence their upper quantile is 0, so capping would turn every 1 into 0.
+        continuous_features = [
+            col for col in self.numerical_features
+            if col in train_df.columns
+            and pd.api.types.is_numeric_dtype(train_df[col])
+            and train_df[col].nunique() > 2
+        ]
+
+        self.outlier_limits = {}
+        if continuous_features:
+            lower_q, upper_q = WINSORISE_QUANTILES
+            module_logger.info(
+                f"Capping continuous features at the {lower_q:.0%}/{upper_q:.0%} training quantiles: "
+                f"{continuous_features}"
+            )
+            for col in continuous_features:
+                # Limits come from the training data only, then get applied to both sets
+                low = train_df[col].quantile(lower_q)
+                high = train_df[col].quantile(upper_q)
+                self.outlier_limits[col] = (low, high)
+
+                train_df[col] = train_df[col].clip(lower=low, upper=high)
+                if col in test_df.columns and pd.api.types.is_numeric_dtype(test_df[col]):
+                    test_df[col] = test_df[col].clip(lower=low, upper=high)
+
+        # No log transform for skewed features. Feature engineering applies clinical
+        # thresholds in raw units (glucose > 100 mg/dL, sysBP < 130 mmHg, WHO BMI bands),
+        # which a log transform here would silently break. Tree models don't care about
+        # skew, and the linear/SVM models standardise inside their own pipelines.
+
         # === HIGH-CARDINALITY FEATURE BINNING ===
         # Bin cigsPerDay feature to reduce cardinality
         if 'cigsPerDay' in self.categorical_features and 'cigsPerDay' in train_df.columns:
             module_logger.info("Binning high-cardinality feature: cigsPerDay")
-            
+
             # Define bin edges and labels
             bins = [-1, 0, 10, 20, 80]
-            labels = ['non_smoker', 'light', 'moderate', 'heavy']
-            
+            labels = SMOKING_INTENSITY_ORDER
+
             # Apply binning
             train_df['smoking_intensity'] = pd.cut(
                 train_df['cigsPerDay'], bins=bins, labels=labels, include_lowest=True

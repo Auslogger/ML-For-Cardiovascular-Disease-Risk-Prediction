@@ -13,10 +13,17 @@ from sklearn.preprocessing import LabelEncoder, OrdinalEncoder
 from src.config import (
     AGE_BINS, AGE_LABELS, PROCESSED_DATA_DIR
 )
+from src.data_preprocessing import SMOKING_INTENSITY_ORDER
 from src.utils import Timer
 
 # Get module logger
 module_logger = logging.getLogger(__name__)
+
+# Categorical columns with a natural order. Without this, OrdinalEncoder sorts
+# alphabetically, which for smoking_intensity gave heavy=0 ... non_smoker=3.
+ORDINAL_CATEGORY_ORDERS = {
+    'smoking_intensity': SMOKING_INTENSITY_ORDER,
+}
 
 class FeatureEngineer:
     """
@@ -41,7 +48,12 @@ class FeatureEngineer:
         self.encoders = {}
         self.categorical_mappings = {}  # Store mappings for consistency
         self.categorical_features_to_encode = list(categorical_features)
-        
+
+    def _add_new_feature(self, name: str) -> None:
+        """Record an engineered feature once (transform() re-runs the same builders)."""
+        if name not in self.new_features:
+            self.new_features.append(name)
+
     def fit_transform(self, X: pd.DataFrame, y: Optional[pd.Series] = None) -> pd.DataFrame:
         """
         Fit and transform features.
@@ -126,23 +138,23 @@ class FeatureEngineer:
         # Pulse Pressure (systolic - diastolic BP)
         if 'sysBP' in X.columns and 'diaBP' in X.columns:
             X['pulse_pressure'] = X['sysBP'] - X['diaBP']
-            self.new_features.append('pulse_pressure')
+            self._add_new_feature('pulse_pressure')
             
             # Mean Arterial Pressure
             X['mean_arterial_pressure'] = X['diaBP'] + (X['pulse_pressure'] / 3)
-            self.new_features.append('mean_arterial_pressure')
+            self._add_new_feature('mean_arterial_pressure')
         
         # Metabolic indicators
         if 'BMI' in X.columns and 'glucose' in X.columns:
             # Combined metabolic risk
             X['metabolic_risk'] = (X['BMI'] > 30).astype(int) + (X['glucose'] > 100).astype(int)
-            self.new_features.append('metabolic_risk')
+            self._add_new_feature('metabolic_risk')
         
         # Cardiovascular risk indicators
         if 'totChol' in X.columns and 'age' in X.columns:
             # Age-adjusted cholesterol risk
             X['age_chol_risk'] = X['totChol'] / X['age']
-            self.new_features.append('age_chol_risk')
+            self._add_new_feature('age_chol_risk')
         
         # Hypertension severity
         if 'sysBP' in X.columns and 'prevalentHyp' in X.columns:
@@ -159,7 +171,7 @@ class FeatureEngineer:
                     return 4  # Crisis
             
             X['hypertension_stage'] = X.apply(hypertension_stage, axis=1)
-            self.new_features.append('hypertension_stage')
+            self._add_new_feature('hypertension_stage')
         
         # Heart rate categories
         if 'heartRate' in X.columns:
@@ -172,7 +184,7 @@ class FeatureEngineer:
                     return 2  # Tachycardia
             
             X['hr_category'] = X['heartRate'].apply(hr_category)
-            self.new_features.append('hr_category')
+            self._add_new_feature('hr_category')
         
         return X
     
@@ -189,22 +201,22 @@ class FeatureEngineer:
         # Age and smoking interaction
         if 'age' in X.columns and 'is_smoking' in X.columns:
             X['age_smoking_interaction'] = X['age'] * (X['is_smoking'] == 'YES').astype(int)
-            self.new_features.append('age_smoking_interaction')
+            self._add_new_feature('age_smoking_interaction')
         
         # BMI and diabetes interaction
         if 'BMI' in X.columns and 'diabetes' in X.columns:
             X['bmi_diabetes_interaction'] = X['BMI'] * X['diabetes']
-            self.new_features.append('bmi_diabetes_interaction')
+            self._add_new_feature('bmi_diabetes_interaction')
         
         # Blood pressure and medication interaction
         if 'sysBP' in X.columns and 'BPMeds' in X.columns:
             X['bp_meds_effectiveness'] = X['sysBP'] * (1 - X['BPMeds'])
-            self.new_features.append('bp_meds_effectiveness')
+            self._add_new_feature('bp_meds_effectiveness')
         
         # Cholesterol and age interaction
         if 'totChol' in X.columns and 'age' in X.columns:
             X['chol_age_interaction'] = X['totChol'] * X['age'] / 100
-            self.new_features.append('chol_age_interaction')
+            self._add_new_feature('chol_age_interaction')
         
         # Multiple risk factors count
         risk_factors = []
@@ -219,7 +231,7 @@ class FeatureEngineer:
         
         if risk_factors:
             X['risk_factor_count'] = sum(risk_factors)
-            self.new_features.append('risk_factor_count')
+            self._add_new_feature('risk_factor_count')
         
         return X
     
@@ -231,28 +243,28 @@ class FeatureEngineer:
         if 'age' in X.columns:
             X['age_group'] = pd.cut(X['age'], bins=AGE_BINS, labels=range(len(AGE_LABELS)), include_lowest=True)
             X['age_group'] = X['age_group'].astype(int)
-            self.new_features.append('age_group')
+            self._add_new_feature('age_group')
         
         # BMI categories (WHO classification)
         if 'BMI' in X.columns:
             bmi_bins = [0, 18.5, 25, 30, 35, 40, 100]
             X['bmi_category'] = pd.cut(X['BMI'], bins=bmi_bins, labels=range(6), include_lowest=True)
             X['bmi_category'] = X['bmi_category'].astype(int)
-            self.new_features.append('bmi_category')
+            self._add_new_feature('bmi_category')
         
         # Cholesterol levels (medical guidelines)
         if 'totChol' in X.columns:
             chol_bins = [0, 200, 240, 1000]
             X['chol_category'] = pd.cut(X['totChol'], bins=chol_bins, labels=range(3), include_lowest=True)
             X['chol_category'] = X['chol_category'].astype(int)
-            self.new_features.append('chol_category')
+            self._add_new_feature('chol_category')
         
         # Glucose levels
         if 'glucose' in X.columns:
             glucose_bins = [0, 70, 100, 126, 1000]
             X['glucose_category'] = pd.cut(X['glucose'], bins=glucose_bins, labels=range(4), include_lowest=True)
             X['glucose_category'] = X['glucose_category'].astype(int)
-            self.new_features.append('glucose_category')
+            self._add_new_feature('glucose_category')
         
         # Handle cigsPerDay binning (if it exists and is categorical)
         if 'cigsPerDay' in X.columns:
@@ -266,7 +278,7 @@ class FeatureEngineer:
                 # Apply binning and convert to numeric codes
                 X['smoking_intensity'] = pd.cut(X['cigsPerDay'], bins=bins, labels=range(4), include_lowest=True)
                 X['smoking_intensity'] = X['smoking_intensity'].astype(int)
-                self.new_features.append('smoking_intensity')
+                self._add_new_feature('smoking_intensity')
                 
                 # Remove original column
                 X = X.drop(columns=['cigsPerDay'], errors='ignore')
@@ -313,8 +325,16 @@ class FeatureEngineer:
                 # Handle other categorical features
                 if X[col].dtype == 'object' or X[col].dtype.name == 'category':
                     # For string categorical features, use ordinal encoding
+                    # (explicit order where one exists, otherwise sorted categories)
                     if fit:
-                        self.encoders[col] = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+                        categories = (
+                            [ORDINAL_CATEGORY_ORDERS[col]] if col in ORDINAL_CATEGORY_ORDERS else 'auto'
+                        )
+                        self.encoders[col] = OrdinalEncoder(
+                            categories=categories,
+                            handle_unknown='use_encoded_value',
+                            unknown_value=-1,
+                        )
                         X[[f'{col}_encoded']] = self.encoders[col].fit_transform(X[[col]])
                         # Store categories for reference
                         self.categorical_mappings[col] = dict(zip(

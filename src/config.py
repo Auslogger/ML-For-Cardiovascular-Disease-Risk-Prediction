@@ -43,6 +43,13 @@ TRAIN_FILE = "train.csv"
 TEST_FILE = "test.csv"
 TARGET_COLUMN = "TenYearCHD"
 
+# Outlier capping (winsorisation) for continuous features, as (lower, upper) quantiles.
+# Limits are learned on the training data only. Binary flags are never capped.
+# 1st/99th rather than 5th/95th: the tighter limits collapsed clinically meaningful
+# ranges (e.g. every heart rate landed in 60-98 bpm, so the brady/tachy category
+# became constant, and diabetic-range glucose >=126 mg/dL was capped to 110).
+WINSORISE_QUANTILES = (0.01, 0.99)
+
 RUN_EBM_IN_PHASE6 = True
 
 # Model configurations
@@ -114,6 +121,10 @@ PHASE6_MODELS = [
 ]
 
 #Phase 8 interpretation
+# Phase 8 explains a tree-based model on purpose: shap.TreeExplainer gives exact SHAP
+# values for tree ensembles in seconds, whereas an SVM would need KernelExplainer
+# (approximate and orders of magnitude slower). So the primary model here is the
+# strongest calibrated tree model from Phase 7, not necessarily the overall winner.
 PHASE8_FINAL_MODEL_SET = [
     "extra_trees_tuned_calibrated",
     "extra_trees_tuned",
@@ -246,8 +257,9 @@ TEST_SIZE = 0.2
 VALIDATION_SIZE = 0.2
 
 # Class imbalance strategies
-# Primary strategy chosen based on sampling comparison:
-# - SMOTE-NC balances classes to ~50:50 while retaining all majority samples.
+# Phase 4 picks the strategy by cross-validated ROC-AUC on the training split.
+# This is only the fallback used when Phase 6 is run on its own and no Phase 4
+# comparison table exists yet.
 PRIMARY_IMBALANCE_STRATEGY = "smote_nc"
 SECONDARY_IMBALANCE_STRATEGIES = ["class_weight"]
 
